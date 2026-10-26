@@ -1,0 +1,67 @@
+# Dry run WITHOUT JFrog: proves Juice Shop compiles, passes tests, packages into the
+# distroless image and actually starts, using public registries.
+#
+# Use it only while waiting for JFrog access. Delete this file before submitting,
+# because the real pipeline must resolve everything through Artifactory.
+
+name: dry-run-no-jfrog
+
+on:
+  push:
+    branches: [jfrog-pipeline]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Compile (install dependencies, build frontend and server)
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          npm install
+          npm run build:server
+
+      - name: Run tests
+        run: npm run test:server
+
+      - name: Prepare runtime files (same as the real pipeline)
+        run: |
+          npm prune --omit=dev
+          rm -rf frontend/node_modules frontend/.angular frontend/src/assets
+          rm -f ftp/legal.md i18n/*.json
+          mkdir -p logs
+
+      - name: Build the image (base image straight from gcr.io for this dry run)
+        run: docker build -t juice-shop:dry-run .
+
+      - name: Start the container and check it answers on port 3000
+        run: |
+          docker run -d --name juice-shop -p 3000:3000 juice-shop:dry-run
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:3000; then
+              echo "Juice Shop is up after $((i * 5)) seconds"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Juice Shop did not start; container logs:"
+          docker logs juice-shop
+          exit 1
+
+      - name: Show image size and container logs
+        if: always()
+        run: |
+          docker images juice-shop:dry-run
+          docker logs juice-shop 2>&1 | tail -n 40 || true

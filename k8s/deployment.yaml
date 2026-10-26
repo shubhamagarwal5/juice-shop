@@ -1,0 +1,80 @@
+# Deploys the image that passed the Xray gate, pulled from the production repository.
+#
+# 1. Create the pull secret (once per namespace):
+#      kubectl create secret docker-registry jfrog-pull \
+#        --docker-server=<JF_HOST> \
+#        --docker-username=<JFROG_USER> \
+#        --docker-password=<JFROG_ACCESS_TOKEN>
+# 2. Replace <JF_HOST> and <BUILD_NUMBER> below, then:
+#      kubectl apply -f k8s/deployment.yaml
+#      kubectl port-forward svc/juice-shop 3000:3000
+#    and open http://localhost:3000
+#
+# Production recommendation: reference the image by digest and enforce signature
+# verification with an admission controller (for example Kyverno or OPA Gatekeeper).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: juice-shop
+  labels:
+    app: juice-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: juice-shop
+  template:
+    metadata:
+      labels:
+        app: juice-shop
+    spec:
+      imagePullSecrets:
+        - name: jfrog-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: juice-shop
+          image: <JF_HOST>/juiceshop-docker-prod-local/juice-shop:<BUILD_NUMBER>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: juice-shop
+  labels:
+    app: juice-shop
+spec:
+  type: ClusterIP
+  selector:
+    app: juice-shop
+  ports:
+    - port: 3000
+      targetPort: 3000

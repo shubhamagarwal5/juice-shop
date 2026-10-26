@@ -1,33 +1,41 @@
+# Based on Juice Shop's upstream .dockerignore, with one key difference:
+# node_modules/, frontend/dist/ and build/ are NOT ignored, because the pipeline
+# compiles them in CI (through Artifactory) and the image only packages the result.
+
+# Source control, CI and local tooling
+.git/
+.github/
+.jfrog/
+.npmrc
+.idea/
 .ai/
 .claude/
 .codeium/
 .continue/
 .cursor/
-.devcontainer.json
-.git/
-.github/
-.idea/
 .junie/
-.mailmap
-.npmrc
-.nyc_output
 .playwright-mcp/
+.devcontainer.json
+.mailmap
+
+# Not needed at runtime
+.nyc_output
 /bom.json
 /bom.xml
 build/reports/
 coverage/
 cypress/
 dist/
-Dockerfile
 frontend/.angular/
-frontend/dist/
 frontend/node_modules/
-logs/
+frontend/src/assets/
 monitoring/
-node_modules/
 rsn/
 screenshots/
 scripts/
 terraform/
 test/
 vagrant/
+k8s/
+Dockerfile
+xray-*.json

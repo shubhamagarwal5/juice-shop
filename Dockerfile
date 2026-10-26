@@ -1,41 +1,30 @@
-FROM node:24 AS installer
-COPY . /juice-shop
-WORKDIR /juice-shop
-RUN npm install -g typescript@^6.0.3
-RUN npm install --omit=dev
-RUN npm dedupe --omit=dev
-RUN rm -rf frontend/node_modules
-RUN rm -rf frontend/.angular
-RUN rm -rf frontend/src/assets
-RUN mkdir logs
-RUN chown -R 65532 logs
-RUN chgrp -R 0 ftp/ frontend/dist/ logs/ data/ i18n/
-RUN chmod -R g=u ftp/ frontend/dist/ logs/ data/ i18n/
-RUN rm ftp/legal.md || true
-RUN rm i18n/*.json || true
+# Packages the application that the CI pipeline has already compiled and tested.
+#
+# Why not build inside Docker (as Juice Shop's upstream Dockerfile does)?
+#   Running `npm install` inside `docker build` fetches packages from npmjs.org directly,
+#   bypassing Artifactory, and those dependencies never appear in build-info.
+#   Compiling in CI and only packaging here keeps every dependency on the governed path.
+#
+# Base image: distroless Node.js 24 (no shell, no package manager), which keeps the
+# OS attack surface small. The pipeline passes BASE_IMAGE pointing at the Artifactory
+# virtual repository so the base image is also pulled through JFrog and scanned by Xray.
+# Production recommendation: pin the base image by digest (@sha256:...) rather than tag.
 
-# keep version in sync with package.json
-ARG CYCLONEDX_NPM_VERSION='^2.0.0||^3.0.0||^4.0.0'
-RUN npm install -g @cyclonedx/cyclonedx-npm@$CYCLONEDX_NPM_VERSION
-RUN npm run sbom
+ARG BASE_IMAGE=gcr.io/distroless/nodejs24-debian13:latest
+FROM ${BASE_IMAGE}
 
-FROM gcr.io/distroless/nodejs24-debian13
-ARG BUILD_DATE
 ARG VCS_REF
-LABEL maintainer="Bjoern Kimminich <bjoern.kimminich@owasp.org>" \
-    org.opencontainers.image.title="OWASP Juice Shop" \
-    org.opencontainers.image.description="Probably the most modern and sophisticated insecure web application" \
-    org.opencontainers.image.authors="Bjoern Kimminich <bjoern.kimminich@owasp.org>" \
-    org.opencontainers.image.vendor="Open Worldwide Application Security Project" \
-    org.opencontainers.image.documentation="https://help.owasp-juice.shop" \
-    org.opencontainers.image.licenses="MIT" \
-    org.opencontainers.image.version="20.3.0" \
-    org.opencontainers.image.url="https://owasp-juice.shop" \
-    org.opencontainers.image.source="https://github.com/juice-shop/juice-shop" \
-    org.opencontainers.image.revision=$VCS_REF \
-    org.opencontainers.image.created=$BUILD_DATE
+ARG BUILD_DATE
+LABEL org.opencontainers.image.title="OWASP Juice Shop" \
+      org.opencontainers.image.description="Juice Shop built through a governed JFrog pipeline" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision=$VCS_REF \
+      org.opencontainers.image.created=$BUILD_DATE
+
 WORKDIR /juice-shop
-COPY --from=installer --chown=65532:0 /juice-shop .
+COPY --chown=65532:0 . .
+
+# Run as the distroless non-root user
 USER 65532
 EXPOSE 3000
 CMD ["/juice-shop/build/app.js"]

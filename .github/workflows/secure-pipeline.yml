@@ -1,0 +1,138 @@
+# Secure CI pipeline for OWASP Juice Shop on the JFrog Platform
+#
+# Principles
+#   1. One trusted path in: every npm package and the Docker base image resolve through
+#      Artifactory, never directly from npmjs.org, Docker Hub or gcr.io.
+#   2. One evidence trail out: every run publishes build-info (git commit, dependencies,
+#      environment, artifacts) so any image can be traced back to exactly what built it.
+#   3. Xray is the quality gate: only builds that pass security policy are promoted
+#      from the dev repository to the production repository.
+#
+# GitHub repository settings (Settings > Secrets and variables > Actions)
+#   Variables:  JF_URL   e.g. https://yourname.jfrog.io
+#               JF_HOST  e.g. yourname.jfrog.io
+#               JF_USER  your JFrog username (the email you signed up with)
+#   Secret:     JF_ACCESS_TOKEN   an access token generated in the JFrog Platform
+#
+# Production recommendation: replace the access token with GitHub OIDC
+# (jfrog/setup-jfrog-cli with oidc-provider-name) so no long-lived secret is stored.
+
+name: secure-pipeline
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_NAME: juice-shop
+  BUILD_NUMBER: ${{ github.run_number }}
+  JF_HOST: ${{ vars.JF_HOST }}
+  NPM_VIRTUAL: juiceshop-npm-virtual
+  DOCKER_VIRTUAL: juiceshop-docker-virtual
+  DOCKER_DEV: juiceshop-docker-dev-local
+  DOCKER_PROD: juiceshop-docker-prod-local
+
+jobs:
+  build-scan-promote:
+    runs-on: ubuntu-latest
+    env:
+      # Base image pulled through Artifactory (virtual repo -> gcr.io remote), not from gcr.io directly
+      BASE_IMAGE: ${{ vars.JF_HOST }}/juiceshop-docker-virtual/distroless/nodejs24-debian13:latest
+      # Image is pushed to the dev repository; it only reaches prod after passing the gate
+      IMAGE: ${{ vars.JF_HOST }}/juiceshop-docker-dev-local/juice-shop:${{ github.run_number }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24 (must match the Node 24 runtime image, because of native modules)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Set up JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Route all npm resolution through Artifactory
+        env:
+          JF_ACCESS_TOKEN: ${{ secrets.JF_ACCESS_TOKEN }}
+        run: |
+          # JFrog CLI resolves the root project's dependencies and records them in build-info
+          jf npmc --repo-resolve="$NPM_VIRTUAL"
+          # Juice Shop's postinstall runs a nested 'npm install' for the Angular frontend.
+          # Point npm's user-level config at Artifactory too, so nothing reaches npmjs.org directly.
+          npm config set registry "https://$JF_HOST/artifactory/api/npm/$NPM_VIRTUAL/"
+          npm config set "//$JF_HOST/artifactory/api/npm/$NPM_VIRTUAL/:_authToken" "$JF_ACCESS_TOKEN"
+
+      - name: Compile (install dependencies, build frontend and server)
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          jf npm install --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
+          # postinstall already compiles, but swallows errors; run tsc explicitly so a failure stops the pipeline
+          npm run build:server
+
+      - name: Run tests
+        # Server-side unit tests. Frontend (Karma) and API tests are skipped to keep CI runtime reasonable.
+        run: npm run test:server
+
+      - name: Prepare runtime files (mirrors the clean-up in Juice Shop's upstream Dockerfile)
+        run: |
+          npm prune --omit=dev
+          rm -rf frontend/node_modules frontend/.angular frontend/src/assets
+          rm -f ftp/legal.md i18n/*.json
+          mkdir -p logs
+
+      - name: Log in to the Artifactory Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.JF_HOST }}
+          username: ${{ vars.JF_USER }}
+          password: ${{ secrets.JF_ACCESS_TOKEN }}
+
+      - name: Pull the base image through Artifactory (recorded as a build dependency)
+        run: jf docker pull "$BASE_IMAGE" --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
+
+      - name: Package as a runnable Docker image
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg VCS_REF="${{ github.sha }}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$IMAGE" .
+
+      - name: Push the image to the dev repository and attach it to build-info
+        run: jf docker push "$IMAGE" --build-name="$BUILD_NAME" --build-number="$BUILD_NUMBER"
+
+      - name: Publish build-info (git commit, dependencies, environment, artifacts)
+        run: |
+          jf rt build-add-git "$BUILD_NAME" "$BUILD_NUMBER"
+          jf rt build-collect-env "$BUILD_NAME" "$BUILD_NUMBER"
+          jf rt build-publish "$BUILD_NAME" "$BUILD_NUMBER"
+
+      - name: Xray scan of the image (full vulnerability report as JSON)
+        run: jf docker scan "$IMAGE" --vuln --format=json > xray-image-scan.json || true
+
+      - name: Keep the scan report with the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-image-scan-${{ github.run_number }}
+          path: xray-image-scan.json
+          if-no-files-found: ignore
+
+      - name: Quality gate (fails the run if the build violates an Xray policy with "Fail Build")
+        run: jf build-scan "$BUILD_NAME" "$BUILD_NUMBER" --fail=true
+
+      - name: Promote to the production repository (only reached if the gate passed)
+        run: |
+          jf rt build-promote "$BUILD_NAME" "$BUILD_NUMBER" "$DOCKER_PROD" \
+            --source-repo="$DOCKER_DEV" --status=released --copy=true \
+            --comment="Passed Xray quality gate in GitHub Actions run ${{ github.run_id }}"
